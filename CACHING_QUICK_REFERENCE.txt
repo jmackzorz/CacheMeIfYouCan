@@ -1,0 +1,186 @@
+/* Redis Caching Quick Reference
+ * 
+ * Pattern: Cache-Aside (Lazy Loading)
+ * Serialization: System.Text.Json
+ * Storage: IDistributedCache (StackExchange.Redis)
+ */
+
+// ============================================
+// CACHE KEYS
+// ============================================
+
+product:1                    // GET /api/products/1
+product:5                    // GET /api/products/5
+product:all_products         // GET /api/products
+
+// ============================================
+// EXPIRATION POLICY
+// ============================================
+
+Absolute Expiration:  15 minutes from creation
+Sliding Expiration:   10 minutes from last access
+Effective TTL:        Min(15 min, 10 min from last access)
+
+// ============================================
+// FLOW DIAGRAM - GET BY ID
+// ============================================
+
+GetByIdAsync(int id)
+  │
+  ├─ Check cache: key = "product:{id}"
+  │  │
+  │  ├─ HIT ──▶ Deserialize + Return ✓ [< 1ms]
+  │  │
+  │  └─ MISS ──▶ Query Database
+  │            │
+  │            ├─ NOT FOUND ──▶ Return null
+  │            │
+  │            └─ FOUND ──▶ Serialize + Store in Cache
+  │                       │
+  │                       └─ Return ✓ [10-50ms]
+
+// ============================================
+// FLOW DIAGRAM - CREATE/UPDATE/DELETE
+// ============================================
+
+CreateAsync(dto)
+  │
+  ├─ Save to Database ✓
+  │
+  └─ Invalidate: "product:all_products"
+
+UpdateAsync(id, dto)
+  │
+  ├─ Update Database ✓
+  │
+  └─ Invalidate:
+     ├─ "product:{id}"
+     └─ "product:all_products"
+
+DeleteAsync(id)
+  │
+  ├─ Delete from Database ✓
+  │
+  └─ Invalidate:
+     ├─ "product:{id}"
+     └─ "product:all_products"
+
+// ============================================
+// DEPENDENCY INJECTION
+// ============================================
+
+// Program.cs
+builder.Services.AddStackExchangeRedisCache(options =>
+{
+    options.Configuration = "localhost:6379";
+});
+
+builder.Services.AddScoped<IProductService, ProductService>();
+
+// ============================================
+// CONSTRUCTOR INJECTION
+// ============================================
+
+public class ProductService : IProductService
+{
+    private readonly IProductRepository _repo;
+    private readonly IDistributedCache _cache;
+    private readonly ILogger<ProductService> _logger;
+
+    public ProductService(
+        IProductRepository repo,
+        IDistributedCache cache,
+        ILogger<ProductService> logger)
+    {
+        _repo = repo;
+        _cache = cache;
+        _logger = logger;
+    }
+}
+
+// ============================================
+// CACHE OPERATIONS
+// ============================================
+
+// Set String (with DTO serialization)
+var json = JsonSerializer.Serialize(productDto);
+var options = CacheConfig.GetCacheOptions();
+await _cache.SetStringAsync(key, json, options);
+
+// Get String (with DTO deserialization)
+var cached = await _cache.GetStringAsync(key);
+var product = JsonSerializer.Deserialize<ProductDto>(cached);
+
+// Remove
+await _cache.RemoveAsync(key);
+
+// ============================================
+// TROUBLESHOOTING
+// ============================================
+
+Redis not running?
+  $ redis-server
+  or
+  $ docker run -d -p 6379:6379 redis
+
+Test Redis connection:
+  $ redis-cli ping
+  PONG
+
+Check cache contents:
+  $ redis-cli
+  > KEYS product:*
+  > GET "product:1"
+  > TTL "product:1"
+  > FLUSHDB  (clear all keys)
+
+View cache logs:
+  Look for [Information], [Debug], [Error] messages
+  from CacheMeIfYouCan.Application.Services.ProductService
+
+// ============================================
+// FILES INVOLVED
+// ============================================
+
+Core Implementation:
+  - Application/Services/IProductService.cs
+  - Application/Services/ProductService.cs
+  - Application/Caching/CacheKeyStrategy.cs
+  - Application/Caching/CacheConfig.cs
+
+Configuration:
+  - Program.cs (AddStackExchangeRedisCache)
+  - appsettings.json (Redis connection string)
+  - CacheMeIfYouCan.csproj (NuGet packages)
+
+Controller:
+  - Controllers/ProductsController.cs
+
+// ============================================
+// PERFORMANCE TIPS
+// ============================================
+
+1. Hit Ratio Monitoring
+   - Track cache hits vs misses
+   - Aim for > 80% hit ratio
+   - Adjust TTL if too low
+
+2. Key Design
+   - Use consistent, hierarchical keys
+   - Easy to parse and invalidate
+   - Avoid complex key generation
+
+3. Serialization
+   - Prefer JSON for simple DTOs
+   - Avoid circular references
+   - Use nullable types carefully
+
+4. Invalidation Timing
+   - Invalidate immediately after DB writes
+   - Don't batch invalidations
+   - Log all invalidations
+
+5. Memory Management
+   - Set Redis maxmemory policy
+   - Monitor cache size
+   - Adjust TTL if memory pressure

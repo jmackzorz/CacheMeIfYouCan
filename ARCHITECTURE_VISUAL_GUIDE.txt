@@ -1,0 +1,357 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                 REDIS CACHING ARCHITECTURE - VISUAL GUIDE                      ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ SYSTEM ARCHITECTURE                                                           │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+                              ┌──────────────────┐
+                              │  HTTP Request    │
+                              │  GET /api/...    │
+                              └────────┬─────────┘
+                                       │
+                              ┌────────▼─────────┐
+                              │ProductsController│
+                              └────────┬─────────┘
+                                       │
+                              ┌────────▼─────────────┐
+                              │IProductService      │
+                              │(interface)          │
+                              └────────┬─────────────┘
+                                       │
+                    ┌──────────────────┼──────────────────┐
+                    │                  │                  │
+          ┌─────────▼────────┐ ┌──────▼────────┐ ┌──────▼────────┐
+          │IDistributedCache │ │IProductRepo   │ │ILogger        │
+          │(Redis)           │ │(Database)     │ │               │
+          └──────────────────┘ └───────────────┘ └───────────────┘
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ CACHE-ASIDE FLOW (GET /api/products/1)                                       │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+ ┌─────────────────┐
+ │ HTTP Request    │
+ │ GET /products/1 │
+ └────────┬────────┘
+          │
+          ▼
+ ┌────────────────────────────┐
+ │ Generate cache key         │
+ │ key = "product:1"          │
+ └────────┬───────────────────┘
+          │
+          ▼
+ ┌────────────────────────────┐
+ │ Check Redis cache          │
+ │ _cache.GetStringAsync(key) │
+ └────────┬───────────────────┘
+          │
+          ├─────────────────────────┐
+          │                         │
+   ┌──────▼─────────┐      ┌───────▼──────────┐
+   │ Cache HIT ✓    │      │ Cache MISS ✗     │
+   │ Value found    │      │ Value not found  │
+   └──────┬─────────┘      └───────┬──────────┘
+          │                        │
+          │                ┌───────▼────────────┐
+          │                │Query SQL Database  │
+          │                │SELECT * FROM...    │
+          │                └───────┬────────────┘
+          │                        │
+          │                ┌───────▼────────────┐
+          │                │Deserialize entity  │
+          │                │Map to ProductDto   │
+          │                └───────┬────────────┘
+          │                        │
+          │                ┌───────▼──────────────────┐
+          │                │Store in Redis cache:     │
+          │                │- Key: "product:1"        │
+          │                │- Value: JSON DTO         │
+          │                │- Expiry: 15min absolute  │
+          │                │- Expiry: 10min sliding   │
+          │                └───────┬──────────────────┘
+          │                        │
+          ├────────────────────────┤
+          │                        │
+   ┌──────▼──────────┐      ┌──────▼──────────┐
+   │Deserialize      │      │Return ProductDto│
+   │cached JSON      │      └──────┬──────────┘
+   └──────┬──────────┘             │
+          │                        │
+          └────────────┬───────────┘
+                       │
+                ┌──────▼──────────┐
+                │ Response 200 OK │
+                │  {id,name,...}  │
+                └─────────────────┘
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ CACHE INVALIDATION FLOW (PUT /api/products/1)                                │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+ ┌─────────────────────┐
+ │ HTTP Request        │
+ │ PUT /products/1     │
+ │ + UpdateProductDto  │
+ └────────┬────────────┘
+          │
+          ▼
+ ┌────────────────────────────┐
+ │ Validate ModelState        │
+ │ Check ID match             │
+ └────────┬───────────────────┘
+          │
+          ▼
+ ┌────────────────────────────┐
+ │ Update SQL Database        │
+ │ UPDATE Products SET ...    │
+ │ WHERE id = 1               │
+ └────────┬───────────────────┘
+          │
+          ▼
+ ┌────────────────────────────┐
+ │ Invalidate Cache:          │
+ │ Specific product           │
+ └────────┬───────────────────┘
+          │
+          ├─ Remove "product:1"
+          │
+          ▼
+ ┌────────────────────────────┐
+ │ Invalidate Cache:          │
+ │ All products list          │
+ └────────┬───────────────────┘
+          │
+          ├─ Remove "product:all_products"
+          │
+          ▼
+ ┌────────────────────────────┐
+ │ Log invalidation events    │
+ │ (Debug level)              │
+ └────────┬───────────────────┘
+          │
+          ▼
+ ┌────────────────────────────┐
+ │ Response 204 No Content    │
+ └────────────────────────────┘
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ CACHE KEYS HIERARCHY                                                          │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+                              Redis Cache
+                                  │
+                    ┌─────────────┴─────────────┐
+                    │                           │
+            ┌───────▼────────┐        ┌────────▼────────┐
+            │ product:1      │        │ product:2       │
+            │ {ProductDto}   │        │ {ProductDto}    │
+            │ TTL: 600s      │        │ TTL: 435s       │
+            └────────────────┘        └─────────────────┘
+
+            ┌────────────────────────────────────────────┐
+            │     product:all_products                    │
+            │     [{ProductDto}, {ProductDto}, ...]       │
+            │     TTL: 523s                               │
+            └────────────────────────────────────────────┘
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ EXPIRATION TIMELINE                                                           │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+  Absolute Expiration: 15 minutes
+  Sliding Expiration:  10 minutes from last access
+
+  Time: 12:00 PM ────────────────── Entry created
+          │
+          ├─ Absolute: 12:15 PM (expires here if not accessed)
+          │
+          ▼
+  Time: 12:05 PM ────────────────── ACCESSED (hit)
+          │
+          ├─ Sliding resets: 12:15 PM → 12:20 PM (access extended)
+          │ But Absolute still at: 12:15 PM
+          │
+          ▼
+  Time: 12:15 PM ────────────────── EXPIRES (absolute wins)
+          │
+          └─ Entry removed from cache
+             Next access: Cache MISS → Database hit
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ DEPENDENCY INJECTION GRAPH                                                    │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+  Program.cs
+  ────────────────────────────────────────
+
+  builder.Services.AddStackExchangeRedisCache(...)
+           │
+           └─▶ IDistributedCache (StackExchange.Redis)
+
+  builder.Services.AddDbContext<ApplicationDbContext>(...)
+           │
+           └─▶ ApplicationDbContext
+
+  builder.Services.AddScoped<IProductRepository, ProductRepository>(...)
+           │
+           └─▶ ProductRepository ─depends on─▶ ApplicationDbContext
+
+  builder.Services.AddScoped<IProductService, ProductService>(...)
+           │
+           ├─depends on─▶ IProductRepository
+           ├─depends on─▶ IDistributedCache
+           └─depends on─▶ ILogger<ProductService>
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ REQUEST/RESPONSE LIFECYCLE                                                    │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+  GET /api/products/1
+       │
+       ▼
+  ProductsController.GetById(1)
+       │
+       ├─ ModelState.IsValid? ✓
+       │
+       ├─ Call IProductService.GetByIdAsync(1)
+       │
+       └─▶ ProductService.GetByIdAsync(1)
+            │
+            ├─ Get cache key: "product:1"
+            │
+            ├─ Check Redis cache
+            │
+            ├─ IF cache hit:
+            │  ├─ Deserialize JSON
+            │  └─ Return ProductDto ──┐
+            │                         │
+            └─ IF cache miss:        │
+               ├─ Query DB             │
+               ├─ Map to ProductDto    │
+               ├─ Serialize to JSON    │
+               ├─ Store in Redis       │
+               └─ Return ProductDto ──┤
+                                      │
+       ┌──────────────────────────────┘
+       │
+       ▼
+  return Ok(productDto)
+       │
+       ▼
+  Response 200 OK
+  {
+    "id": 1,
+    "name": "Product A",
+    "price": 29.99,
+    ...
+  }
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ ERROR HANDLING FLOW                                                           │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+  try
+  {
+    await SetCacheAsync(key, value);
+  }
+  catch (Exception ex)
+  {
+    _logger.LogError(ex, "Error setting cache");
+    ↓
+    Continue execution (no throw)
+    ↓
+    Application still works
+    ↓
+    Data saved to database ✓
+    ↓
+    Cache write failed ✗
+    ↓
+    Next request will refetch from DB
+    ↓
+    No data loss, just performance hit
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ LOGGING MATRIX                                                                │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+  Operation           │ Level        │ Message
+  ────────────────────┼──────────────┼──────────────────────────────────
+  Cache hit           │ Information  │ "Cache hit for product ID 1"
+  Cache miss          │ Information  │ "Cache miss for product ID 5 -..."
+  Cache set           │ Debug        │ "Cache set for key product:5"
+  Cache remove        │ Debug        │ "Cache invalidated for key..."
+  Product not found   │ Warning      │ "Product ID 999 not found..."
+  Error writing cache │ Error        │ "Error setting cache for key..."
+  Error removing      │ Error        │ "Error invalidating cache..."
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ PERFORMANCE PROFILE                                                           │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+  Without Cache:
+  ──────────────
+  GetByIdAsync(1): ~50ms  (DB round trip)
+  GetByIdAsync(2): ~50ms  (DB round trip)
+  GetByIdAsync(3): ~50ms  (DB round trip)
+  Total 100 calls: ~5000ms
+
+  With Cache:
+  ──────────
+  GetByIdAsync(1): ~50ms  (Cache miss, stored)
+  GetByIdAsync(1): <1ms   (Cache hit)
+  GetByIdAsync(1): <1ms   (Cache hit)
+  GetByIdAsync(2): ~50ms  (Cache miss, stored)
+  GetByIdAsync(2): <1ms   (Cache hit)
+  Total 100 calls: ~60ms
+
+  Improvement: ~83x faster ✓
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ REDIS CLI COMMANDS                                                            │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+  redis-cli
+
+  > PING
+  PONG
+
+  > KEYS product:*
+  1) "product:1"
+  2) "product:2"
+  3) "product:all_products"
+
+  > GET "product:1"
+  "{\"id\":1,\"name\":\"Product A\",...}"
+
+  > TTL "product:1"
+  (integer) 432  (seconds remaining)
+
+  > DEL "product:1"
+  (integer) 1
+
+  > FLUSHDB
+  OK
+
+  > MONITOR
+  (shows all operations in real-time)
+
+
+═══════════════════════════════════════════════════════════════════════════════
+
+                          ✅ IMPLEMENTATION COMPLETE ✅
+
+═══════════════════════════════════════════════════════════════════════════════
